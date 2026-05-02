@@ -128,7 +128,10 @@ for f in *; do
 	file_name=$f
 	base_name=${file_name%.*}
 	searched_dst=" & quoted form of (dstFolderPosix & "/") & "\"${base_name}_srch.pdf\"
-	if [ -e \"$dst_path\" ] || [ -e \"$searched_dst\" ]; then
+	searched_dst_upper=" & quoted form of (dstFolderPosix & "/") & "\"${base_name}_srch.PDF\"
+	original_dst_lower=" & quoted form of (dstFolderPosix & "/") & "\"${base_name}.pdf\"
+	original_dst_upper=" & quoted form of (dstFolderPosix & "/") & "\"${base_name}.PDF\"
+	if [ -e \"$dst_path\" ] || [ -e \"$searched_dst\" ] || [ -e \"$searched_dst_upper\" ] || [ -e \"$original_dst_lower\" ] || [ -e \"$original_dst_upper\" ]; then
 		continue
 	fi
 	if cp \"$f\" " & quoted form of dstFolderPosix & "/; then
@@ -217,7 +220,10 @@ done | /usr/bin/sort -rn | /usr/bin/awk -v retain=\"$retain_count\" 'NR > retain
 	base_name=${file_name%.*}
 	dst_path=\"$dst_dir/$file_name\"
 	searched_dst=\"$dst_dir/${base_name}_srch.pdf\"
-	if [ ! -e \"$dst_path\" ] && [ ! -e \"$searched_dst\" ]; then
+	searched_dst_upper=\"$dst_dir/${base_name}_srch.PDF\"
+	original_dst_lower=\"$dst_dir/${base_name}.pdf\"
+	original_dst_upper=\"$dst_dir/${base_name}.PDF\"
+	if [ ! -e \"$dst_path\" ] && [ ! -e \"$searched_dst\" ] && [ ! -e \"$searched_dst_upper\" ] && [ ! -e \"$original_dst_lower\" ] && [ ! -e \"$original_dst_upper\" ]; then
 		printf 'SKIPPED	%s
 ' \"$path\"
 		continue
