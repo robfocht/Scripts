@@ -1,7 +1,8 @@
-property volumeName : "UtilPi Files"
-property shareURL : "smb://utilpi/UtilPi%20Files"
-property srcFolderPosix : "/Volumes/UtilPi Files/scans"
+property volumeName : "USBSTORAGE"
+property shareURL : "smb://EPSON%20WF-4830%20Series._smb._tcp.local/USBSTORAGE"
+property srcFolderPosix : "/Volumes/USBSTORAGE/EPSCAN"
 property dstFolderPosix : "/Users/rfocht/Documents/Scans"
+property retainedSourceScanCount : 10
 property shellPath : "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 on run
@@ -25,7 +26,17 @@ on run
 	set movedCount to count of importedPairs
 	
 	if movedCount is 0 then
-		«event sysonotf» "No scans to import." given «class appr»:"Scans Import"
+		set cleanupResult to my cleanupSourceFolder()
+		set {cleanupDeletedCount, cleanupSkippedCount, cleanupFailureCount, cleanupDetails} to my splitCleanupResult(cleanupResult)
+		set noImportMessage to "No scans to import."
+		if cleanupDeletedCount > 0 then
+			set noImportMessage to noImportMessage & " Source cleanup deleted: " & cleanupDeletedCount & "."
+		end if
+		if cleanupFailureCount > 0 then
+			«event sysodlog» noImportMessage & " Source cleanup failed: " & cleanupFailureCount & "." & return & return & cleanupDetails given «class btns»:{"OK"}, «class dflt»:"OK"
+		else
+			«event sysonotf» noImportMessage given «class appr»:"Scans Import"
+		end if
 		openScansInFinder()
 		return
 	end if
@@ -33,6 +44,7 @@ on run
 	set ocrCount to 0
 	set skippedCount to 0
 	set failedSummaries to {}
+	set metadataFailedSummaries to {}
 	set processedCount to 0
 	set progress total steps to movedCount
 	set progress completed steps to 0
@@ -45,9 +57,14 @@ on run
 		set progress additional description to "Working on " & («event sysoexec» "/usr/bin/basename " & quoted form of dstPathText)
 		if my isPdfFile(dstPathText) then
 			try
-				my createSearchablePdf(dstPathText)
-				my deleteSourceFile(srcPathText)
+				set searchablePathText to my createSearchablePdf(dstPathText)
 				set ocrCount to ocrCount + 1
+				try
+					my preserveCreationDate(srcPathText, searchablePathText)
+				on error metadataErrMsg number metadataErrNum
+					set metadataName to «event sysoexec» "/usr/bin/basename " & quoted form of searchablePathText
+					set end of metadataFailedSummaries to (metadataName & " (" & metadataErrNum & "): " & metadataErrMsg)
+				end try
 			on error errMsg number errNum
 				set failedName to «event sysoexec» "/usr/bin/basename " & quoted form of dstPathText
 				set end of failedSummaries to (failedName & " (" & errNum & "): " & errMsg)
@@ -59,14 +76,40 @@ on run
 	end repeat
 	
 	set progress additional description to ""
+	set cleanupResult to my cleanupSourceFolder()
+	set {cleanupDeletedCount, cleanupSkippedCount, cleanupFailureCount, cleanupDetails} to my splitCleanupResult(cleanupResult)
 	
 	set summaryMessage to "Imported " & movedCount & " file(s). Searchable PDFs created: " & ocrCount & "."
 	if skippedCount > 0 then
 		set summaryMessage to summaryMessage & " Non-PDF skipped: " & skippedCount & "."
 	end if
+	if cleanupDeletedCount > 0 then
+		set summaryMessage to summaryMessage & " Source cleanup deleted: " & cleanupDeletedCount & "."
+	end if
+	if (count of metadataFailedSummaries) > 0 then
+		set summaryMessage to summaryMessage & " Creation date preservation failed: " & (count of metadataFailedSummaries) & "."
+	end if
+	if cleanupFailureCount > 0 then
+		set summaryMessage to summaryMessage & " Source cleanup failed: " & cleanupFailureCount & "."
+	end if
 	if (count of failedSummaries) > 0 then
 		set summaryMessage to summaryMessage & " OCR failed: " & (count of failedSummaries) & "."
-		«event sysodlog» summaryMessage & return & return & "Failures:" & return & (my joinList(failedSummaries, return)) given «class btns»:{"OK"}, «class dflt»:"OK"
+		set detailMessage to "OCR failures:" & return & (my joinList(failedSummaries, return))
+		if (count of metadataFailedSummaries) > 0 then
+			set detailMessage to detailMessage & return & return & "Creation date preservation failures:" & return & (my joinList(metadataFailedSummaries, return))
+		end if
+		if cleanupFailureCount > 0 then
+			set detailMessage to detailMessage & return & return & "Source cleanup failures:" & return & cleanupDetails
+		end if
+		«event sysodlog» summaryMessage & return & return & detailMessage given «class btns»:{"OK"}, «class dflt»:"OK"
+	else if (count of metadataFailedSummaries) > 0 then
+		set detailMessage to "Searchable PDFs were created, but their creation dates could not be matched to the originals:" & return & return & (my joinList(metadataFailedSummaries, return))
+		if cleanupFailureCount > 0 then
+			set detailMessage to detailMessage & return & return & "Source cleanup failures:" & return & cleanupDetails
+		end if
+		«event sysodlog» summaryMessage & return & return & detailMessage given «class btns»:{"OK"}, «class dflt»:"OK"
+	else if cleanupFailureCount > 0 then
+		«event sysodlog» summaryMessage & return & return & "Source cleanup failures:" & return & cleanupDetails given «class btns»:{"OK"}, «class dflt»:"OK"
 	else
 		«event sysonotf» summaryMessage given «class appr»:"Scans Import"
 	end if
@@ -82,7 +125,13 @@ for f in *; do
 	[ -e \"$f\" ] || continue
 	src_path=" & quoted form of (srcFolderPosix & "/") & "\"$f\"
 	dst_path=" & quoted form of (dstFolderPosix & "/") & "\"$f\"
-	if cp -n \"$f\" " & quoted form of dstFolderPosix & "/; then
+	file_name=$f
+	base_name=${file_name%.*}
+	searched_dst=" & quoted form of (dstFolderPosix & "/") & "\"${base_name}_srch.pdf\"
+	if [ -e \"$dst_path\" ] || [ -e \"$searched_dst\" ]; then
+		continue
+	fi
+	if cp \"$f\" " & quoted form of dstFolderPosix & "/; then
 		printf '%s	%s
 ' \"$src_path\" \"$dst_path\"
 	fi
@@ -105,7 +154,20 @@ on createSearchablePdf(inputPath)
 	set ocrCommand to "PATH=" & quoted form of shellPath & " " & quoted form of resolvedOcrmypdfPath & " --deskew --skip-text -- " & quoted form of inputPath & " " & quoted form of outputPath
 	«event sysoexec» ocrCommand
 	my moveFileToTrash(inputPath)
+	return outputPath
 end createSearchablePdf
+
+on preserveCreationDate(sourcePath, targetPath)
+	set dateString to «event sysoexec» "sh -c " & quoted form of "
+birth_epoch=$(/usr/bin/stat -f %B -- \"$1\")
+if [ -z \"$birth_epoch\" ] || [ \"$birth_epoch\" -le 0 ]; then
+	echo \"Source file has no usable creation date\" >&2
+	exit 1
+fi
+/bin/date -r \"$birth_epoch\" '+%m/%d/%Y %H:%M:%S'
+" & " sh " & quoted form of sourcePath
+	«event sysoexec» "/usr/bin/SetFile -d " & quoted form of dateString & " " & quoted form of targetPath
+end preserveCreationDate
 
 on resolveOcrmypdfPath()
 	set lookupCommand to "PATH=" & quoted form of shellPath & " sh -c " & quoted form of "for candidate in /opt/homebrew/bin/ocrmypdf /usr/local/bin/ocrmypdf; do
@@ -124,11 +186,7 @@ input_path=$1
 parent_path=$(dirname \"$input_path\")
 file_name=$(basename \"$input_path\")
 base_name=${file_name%.*}
-extension=${file_name##*.}
-if [ \"$base_name\" = \"$file_name\" ]; then
-	extension=pdf
-fi
-printf '%s/%s_srch.%s' \"$parent_path\" \"$base_name\" \"$extension\"
+printf '%s/%s_srch.pdf' \"$parent_path\" \"$base_name\"
 " & " sh " & quoted form of inputPath
 end searchedPdfPathFor
 
@@ -139,9 +197,44 @@ on moveFileToTrash(posixPath)
 	end tell
 end moveFileToTrash
 
-on deleteSourceFile(posixPath)
-	«event sysoexec» "rm -f " & quoted form of posixPath
-end deleteSourceFile
+on cleanupSourceFolder()
+	try
+		return «event sysoexec» "sh -c " & quoted form of "
+src_dir=$1
+dst_dir=$2
+retain_count=$3
+/usr/bin/find \"$src_dir\" -maxdepth 1 -type f -print | while IFS= read -r path; do
+	birth_epoch=$(/usr/bin/stat -f %B -- \"$path\" 2>/dev/null || echo 0)
+	modify_epoch=$(/usr/bin/stat -f %m -- \"$path\" 2>/dev/null || echo 0)
+	sort_epoch=$birth_epoch
+	if [ -z \"$sort_epoch\" ] || [ \"$sort_epoch\" -le 0 ]; then
+		sort_epoch=$modify_epoch
+	fi
+	printf '%s	%s
+' \"$sort_epoch\" \"$path\"
+done | /usr/bin/sort -rn | /usr/bin/awk -v retain=\"$retain_count\" 'NR > retain { sub(/^[^\t]*\t/, \"\"); print }' | while IFS= read -r path; do
+	file_name=${path##*/}
+	base_name=${file_name%.*}
+	dst_path=\"$dst_dir/$file_name\"
+	searched_dst=\"$dst_dir/${base_name}_srch.pdf\"
+	if [ ! -e \"$dst_path\" ] && [ ! -e \"$searched_dst\" ]; then
+		printf 'SKIPPED	%s
+' \"$path\"
+		continue
+	fi
+	if /bin/rm -f -- \"$path\"; then
+		printf 'DELETED	%s
+' \"$path\"
+	else
+		printf 'FAILED	%s
+' \"$path\"
+	fi
+done
+" & " sh " & quoted form of srcFolderPosix & " " & quoted form of dstFolderPosix & " " & quoted form of (retainedSourceScanCount as text)
+	on error errMsg number errNum
+		return "FAILED	Source cleanup command (" & errNum & "): " & errMsg
+	end try
+end cleanupSourceFolder
 
 on splitImportPair(pairText)
 	set appleTextItemDelimiters to AppleScript's text item delimiters
@@ -152,6 +245,28 @@ on splitImportPair(pairText)
 	if (count of pairItems) is not 2 then error "Unexpected import record: " & pairText
 	return pairItems
 end splitImportPair
+
+on splitCleanupResult(cleanupText)
+	set deletedCount to 0
+	set skippedCount to 0
+	set failedCount to 0
+	set detailLines to {}
+	if cleanupText is not "" then
+		repeat with cleanupLine in paragraphs of cleanupText
+			set lineText to contents of cleanupLine
+			if lineText starts with "DELETED" & tab then
+				set deletedCount to deletedCount + 1
+			else if lineText starts with "SKIPPED" & tab then
+				set skippedCount to skippedCount + 1
+				set end of detailLines to lineText
+			else if lineText starts with "FAILED" & tab then
+				set failedCount to failedCount + 1
+				set end of detailLines to lineText
+			end if
+		end repeat
+	end if
+	return {deletedCount, skippedCount, failedCount, my joinList(detailLines, return)}
+end splitCleanupResult
 
 on isPdfFile(filePath)
 	set lowerPath to «event sysoexec» "/bin/echo " & quoted form of filePath & " | /usr/bin/tr '[:upper:]' '[:lower:]'"
